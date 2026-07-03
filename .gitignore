@@ -1,0 +1,14 @@
+# Секреты / временные приёмники — НИКОГДА не коммитить
+TEMP_SECRET_PASTE.txt
+.env
+*.env
+!.env.example
+
+# Дампы данных кабинета (бизнес-данные X5) — не версионируем
+raw_data/
+yabbi_automate/raw_data/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
