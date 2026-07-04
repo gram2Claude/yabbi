@@ -39,15 +39,23 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://my.yabbi.me"
 LOGIN_PATH = "/login?method=account"
 
-HTTP_TIMEOUT_SEC = 120          # эндпоинты кабинета медленные
+HTTP_TIMEOUT_SEC = 180          # эндпоинты медленные; батч из ID_CHUNK id ~30-35 с — таймаут с запасом
 RETRY_MAX = 5                   # повторов при сетевой ошибке / протухшей сессии
 RETRY_BASE_SEC = 2              # начальная пауза (удваивается)
 SESSION_TTL_SEC = 3600          # cookie as-account-session живёт 1 час (Max-Age=3600)
 SESSION_REFRESH_LEEWAY_SEC = 120  # перелогиниваться заранее
+ID_CHUNK = 5                    # id кампаний на один запрос /report-ajax (~5-7 с на кампанию)
+
+MSK_TZ = timezone(timedelta(hours=3))  # граница суток Yabbi — московская полночь
 
 # Правила запроса (см. info/00_yabbi_source.md, §5):
+# - сутки Yabbi бакетируются по МОСКОВСКОЙ полуночи; startTime==endTime возвращает НЕ весь
+#   день, а лишь стартовый ~часовой бакет → день D забирается окном [D 00:00 МСК,
+#   D+1 00:00 МСК] с фильтром по ключу/полю дня == D (хвост D+1 отбрасывается);
 # - статистика по кампаниям/баннерам — по 1 дню за запрос (обход 16КБ-сетевого затыка);
-# - охват (reach) — накопительно за [global_start_date, D] (неаддитивен, не по дням);
+# - охват (reach) — накопительно за [global_start_date, конец дня D МСК] (неаддитивен);
+# - id кампаний в /report-ajax — батчами по ID_CHUNK: сервер тратит ~5-7 с на кампанию,
+#   полный список за раз в плохие дни не отвечает вовсе (замер 2026-07-04);
 # - обязателен gzip (requests шлёт Accept-Encoding: gzip и распаковывает сам).
 
 # ── Колонки итоговых DataFrame (фиксируют состав и порядок) ────────────────────
@@ -56,7 +64,7 @@ CAMPAIGN_DICT_COLUMNS = ["id", "name", "type", "bidType", "status"]
 
 CAMPAIGNS_DAILY_COLUMNS = [
     "date", "id", "name",
-    "win", "click", "budget",
+    "win", "load", "click", "budget",
     "bid", "auction",
     "firstQuartile", "midpoint", "thirdQuartile", "complete",
 ]
@@ -170,24 +178,35 @@ class YabbiClient:
     def fetch_campaigns_statistics_daily(
         self, campaign_ids: list[str], start_ms: int, end_ms: int
     ) -> dict[str, list[dict[str, Any]]]:
-        """Статистика по кампаниям, keyed by date. Требует id кампаний."""
-        data = self._get_json(
-            "/report-ajax",
-            {"method": "campaigns-statistics-daily", "startTime": start_ms,
-             "endTime": end_ms, "id": ",".join(campaign_ids)},
-        )
-        return data if isinstance(data, dict) else {}
+        """Статистика по кампаниям, keyed by date. Требует id кампаний.
+
+        id уходят батчами по ID_CHUNK (каждая кампания ровно в одном батче),
+        ответы сливаются по датным ключам.
+        """
+        out: dict[str, list[dict[str, Any]]] = {}
+        for chunk in _chunks(campaign_ids, ID_CHUNK):
+            data = self._get_json(
+                "/report-ajax",
+                {"method": "campaigns-statistics-daily", "startTime": start_ms,
+                 "endTime": end_ms, "id": ",".join(chunk)},
+            )
+            for day, rows in (data if isinstance(data, dict) else {}).items():
+                out.setdefault(day, []).extend(rows or [])
+        return out
 
     def fetch_campaigns_statistics_total(
         self, campaign_ids: list[str], start_ms: int, end_ms: int
     ) -> list[dict[str, Any]]:
-        """Итог по кампаниям за период (несёт охват amountIFA)."""
-        data = self._get_json(
-            "/report-ajax",
-            {"method": "campaigns-statistics", "startTime": start_ms,
-             "endTime": end_ms, "id": ",".join(campaign_ids)},
-        )
-        return data if isinstance(data, list) else []
+        """Итог по кампаниям за период (несёт охват amountIFA). id — батчами по ID_CHUNK."""
+        out: list[dict[str, Any]] = []
+        for chunk in _chunks(campaign_ids, ID_CHUNK):
+            data = self._get_json(
+                "/report-ajax",
+                {"method": "campaigns-statistics", "startTime": start_ms,
+                 "endTime": end_ms, "id": ",".join(chunk)},
+            )
+            out.extend(data if isinstance(data, list) else [])
+        return out
 
     def fetch_per_banners_per_days(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
         """Статистика по баннерам по дням (аккаунт целиком). Пустой период → []."""
@@ -200,13 +219,21 @@ class YabbiClient:
     def fetch_campaigns_banners_daily(
         self, campaign_ids: list[str], start_ms: int, end_ms: int
     ) -> dict[str, list[dict[str, Any]]]:
-        """Баннеры по дням для заданных кампаний, keyed by date. Несёт url + campaign."""
-        data = self._get_json(
-            "/report-ajax",
-            {"method": "campaigns-banners-daily", "startTime": start_ms,
-             "endTime": end_ms, "id": ",".join(campaign_ids)},
-        )
-        return data if isinstance(data, dict) else {}
+        """Баннеры по дням для заданных кампаний, keyed by date. Несёт url + campaign.
+
+        id — батчами по ID_CHUNK (метод быстрый, но батчинг единообразен и страхует
+        от эпизодических зависаний /report-ajax).
+        """
+        out: dict[str, list[dict[str, Any]]] = {}
+        for chunk in _chunks(campaign_ids, ID_CHUNK):
+            data = self._get_json(
+                "/report-ajax",
+                {"method": "campaigns-banners-daily", "startTime": start_ms,
+                 "endTime": end_ms, "id": ",".join(chunk)},
+            )
+            for day, rows in (data if isinstance(data, dict) else {}).items():
+                out.setdefault(day, []).extend(rows or [])
+        return out
 
 
 class _SessionLost(Exception):
@@ -216,17 +243,28 @@ class _SessionLost(Exception):
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def _to_ms(day: str) -> int:
-    """`YYYY-MM-DD` → Unix-время в миллисекундах (полночь UTC).
+    """`YYYY-MM-DD` → Unix-время в миллисекундах (полночь МСК).
 
-    Проверено на живом кабинете: фильтр по дням работает с полуночью UTC.
+    Yabbi бакетирует сутки по московской полуночи (проверено 2026-07-04 сверкой с
+    кабинетом: полуночь UTC сдвигала окна на 3 ч — дневной бакет терял 00:00-03:00 МСК,
+    цифры расходились с кабинетом).
     """
-    dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=MSK_TZ)
     return int(dt.timestamp()) * 1000
 
 
+def _day_after(day: str) -> str:
+    return (datetime.strptime(day, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
+
+
+def _end_of_day_ms(day: str) -> int:
+    """Последняя мс дня D по МСК — инклюзивная правая граница, не задевающая бакет D+1."""
+    return _to_ms(_day_after(day)) - 1
+
+
 def _yesterday() -> str:
-    # UTC — согласовано с _to_ms (окна считаются в полночь UTC).
-    return (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    # МСК — согласовано с _to_ms (границы суток Yabbi московские).
+    return (datetime.now(MSK_TZ).date() - timedelta(days=1)).isoformat()
 
 
 def _date_range(date_from: str, date_to: str) -> list[str]:
@@ -263,19 +301,24 @@ def _int(value: Any) -> int:
     return int(_num(value))
 
 
+def _chunks(items: list[str], size: int) -> list[list[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
 # ── Публичные функции ─────────────────────────────────────────────────────────
 
 def get_campaign_dict() -> pd.DataFrame:
     """Справочник кампаний.
 
-    Источник: /ajax?method=campaign-list, окно [YABBI_GLOBAL_START_DATE, вчера],
-    status=all. Ежедневно перезаписывается целиком. Дедуп по `id` (выживает первая).
+    Источник: /ajax?method=campaign-list, окно [YABBI_GLOBAL_START_DATE, вчера
+    ВКЛЮЧИТЕЛЬНО (по конец дня МСК)], status=all. Ежедневно перезаписывается целиком.
+    Дедуп по `id` (выживает первая).
 
     Колонки: id, name, type (rtb=баннер / vast=видео), bidType (click/show), status.
     """
     client = YabbiClient()
     start_ms = _to_ms(_global_start_date())
-    end_ms = _to_ms(_yesterday())
+    end_ms = _end_of_day_ms(_yesterday())
     rows = client.fetch_campaign_list(start_ms, end_ms)
     if not rows:
         return pd.DataFrame(columns=CAMPAIGN_DICT_COLUMNS)
@@ -288,23 +331,29 @@ def get_campaigns_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
     """Статистика по кампаниям по дням.
 
     Источник: /report-ajax?method=campaigns-statistics-daily (нужны id кампаний
-    из справочника). Забор — ПО ОДНОМУ ДНЮ за запрос.
+    из справочника). Забор — по одному дню, id — батчами по ID_CHUNK
+    (день D = ceil(N_кампаний / ID_CHUNK) запросов).
 
-    Колонки: date, id, name, win, click, budget, bid, auction,
+    Соответствие кабинету («Мои кампании»): «Показы» = win, «Видимость» = load,
+    «Клики» = click, CTR = click/win.
+
+    Колонки: date, id, name, win, load, click, budget, bid, auction,
              firstQuartile, midpoint, thirdQuartile, complete.
     """
     client = YabbiClient()
-    dict_rows = client.fetch_campaign_list(_to_ms(_global_start_date()), _to_ms(_yesterday()))
+    dict_rows = client.fetch_campaign_list(_to_ms(_global_start_date()), _end_of_day_ms(_yesterday()))
     campaign_ids = list(dict.fromkeys(str(e["id"]) for e in dict_rows if e.get("id")))
     if not campaign_ids:
         return pd.DataFrame(columns=CAMPAIGNS_DAILY_COLUMNS)
 
-    metric_keys = ["win", "click", "budget", "bid", "auction",
+    metric_keys = ["win", "load", "click", "budget", "bid", "auction",
                    "firstQuartile", "midpoint", "thirdQuartile", "complete"]
     all_rows: list[dict[str, Any]] = []
     for day in _date_range(date_from, date_to):
-        # endTime у Yabbi ВКЛЮЧАЕТ день endTime → для одного дня startTime==endTime==D.
-        day_data = client.fetch_campaigns_statistics_daily(campaign_ids, _to_ms(day), _to_ms(day))
+        # Окно [D 00:00 МСК, D+1 00:00 МСК]: startTime==endTime вернул бы лишь стартовый
+        # ~часовой бакет. Хвостовой бакет D+1 отбрасывается фильтром по ключу дня ниже.
+        day_data = client.fetch_campaigns_statistics_daily(
+            campaign_ids, _to_ms(day), _to_ms(_day_after(day)))
         for stat_day, camp_rows in (day_data or {}).items():
             if stat_day != day:
                 continue
@@ -331,17 +380,17 @@ def get_banners_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
     Колонки: date, campaign_id, URL, show, click, complete.
     """
     client = YabbiClient()
-    dict_rows = client.fetch_campaign_list(_to_ms(_global_start_date()), _to_ms(_yesterday()))
+    dict_rows = client.fetch_campaign_list(_to_ms(_global_start_date()), _end_of_day_ms(_yesterday()))
     campaign_ids = list(dict.fromkeys(str(e["id"]) for e in dict_rows if e.get("id")))
 
     all_rows: list[dict[str, Any]] = []
     for day in _date_range(date_from, date_to):
         day_ms = _to_ms(day)
-        next_ms = _to_ms((datetime.strptime(day, "%Y-%m-%d").date() + timedelta(days=1)).isoformat())
+        next_ms = _to_ms(_day_after(day))
 
         # 1) метрики по баннерам за день, агрегируем по URL.
-        # per-banners НЕ принимает нулевой диапазон (startTime==endTime → 400), поэтому
-        # запрашиваем [D, D+1] и оставляем только строки дня D (endTime включает след. день).
+        # Окно [D 00:00 МСК, D+1 00:00 МСК] (нулевой диапазон метод отвергает 400);
+        # строки хвостового бакета D+1 отсекаются фильтром day == D.
         agg: dict[str, dict[str, int]] = {}
         for r in client.fetch_per_banners_per_days(day_ms, next_ms):
             if r.get("day") != day:
@@ -354,7 +403,7 @@ def get_banners_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
             a["click"] += _int(r.get("click"))
             a["complete"] += _int(r.get("complete"))
 
-        # 2) карта URL → campaign за тот же день (только строки дня D — endTime включает D+1)
+        # 2) карта URL → campaign за тот же день (только строки дня D — хвост D+1 отсекаем)
         url_to_camp: dict[str, str] = {}
         if campaign_ids:
             banners = client.fetch_campaigns_banners_daily(campaign_ids, day_ms, next_ms)
@@ -405,7 +454,7 @@ def get_reach_cumulative(
         )
 
     client = YabbiClient()
-    dict_rows = client.fetch_campaign_list(_to_ms(gs), _to_ms(_yesterday()))
+    dict_rows = client.fetch_campaign_list(_to_ms(gs), _end_of_day_ms(_yesterday()))
     campaign_ids = list(dict.fromkeys(str(e["id"]) for e in dict_rows if e.get("id")))
     name_by_id = {str(e["id"]): e.get("name") for e in dict_rows if e.get("id")}
     if not campaign_ids:
@@ -422,8 +471,8 @@ def get_reach_cumulative(
 
     all_rows: list[dict[str, Any]] = []
     for day in query_days:
-        # endTime включает день D → накопительный охват за [global_start_date, D].
-        end_ms = _to_ms(day)
+        # Накопительно по КОНЕЦ дня D МСК (последняя мс дня — бакет D+1 не задевается).
+        end_ms = _end_of_day_ms(day)
         for row in client.fetch_campaigns_statistics_total(campaign_ids, gs_ms, end_ms):
             cid = str(row.get("id"))
             all_rows.append({

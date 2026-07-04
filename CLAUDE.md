@@ -41,7 +41,7 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
 | Функция | Гранулярность | Метод-источник |
 |---------|---------------|----------------|
 | `get_campaign_dict()` | справочник кампаний | `/ajax?method=campaign-list` |
-| `get_campaigns_daily_stat(date_from, date_to)` | кампания × день | `/report-ajax?method=campaigns-statistics-daily` |
+| `get_campaigns_daily_stat(date_from, date_to)` | кампания × день (вкл. «Видимость» = `load`) | `/report-ajax?method=campaigns-statistics-daily` |
 | `get_banners_daily_stat(date_from, date_to)` | баннер × день | `/statistics/statistics-per-banners-per-days` (+ `campaigns-banners-daily` для `campaign_id`) |
 | `get_reach_cumulative(global_start_date, date_from, date_to)` | кампания × день (накопительно) | `/report-ajax?method=campaigns-statistics` |
 
@@ -49,9 +49,15 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
 
 ## Ключевые правила источника (критично — легко ошибиться)
 
-- **`startTime`/`endTime` — Unix-мс; `endTime` ВКЛЮЧАЕТ свой день.** Для одного дня D:
-  `campaigns-statistics-daily` — `startTime==endTime==D`; `per-banners` — `[D, D+1]` + фильтр `day==D`
-  (нулевой диапазон `startTime==endTime` этот метод отвергает `400`); охват — `endTime=D` (накопительно).
+- **Сутки Yabbi — по МОСКОВСКОЙ полуночи; `startTime`/`endTime` — Unix-мс** (`_to_ms` даёт полночь МСК).
+  ⚠️ `startTime==endTime` возвращает НЕ весь день, а лишь стартовый ~часовой бакет (проверено 2026-07-04:
+  занижение в 15–20 раз). День D забирается окном **`[D 00:00 МСК, D+1 00:00 МСК]` + фильтр по ключу/полю
+  дня `== D`** (daily и per-banners одинаково; per-banners нулевой диапазон отвергает `400`);
+  охват — `endTime = конец дня D МСК` (последняя мс дня, накопительно).
+- **Кабинет ↔ `state`: «Показы» = `win`, «Видимость» = `load`, «Клики» = `click`** (CTR = click/win;
+  `view` — НЕ «Видимость», он чуть больше `load`). Сверено с кабинетом до единицы (3 кампании, 2026-07-04).
+- **`/report-ajax` тратит ~5–7 с НА КАЖДУЮ кампанию из `id`** (в плохие дни полный список из 41 id не
+  отвечает вовсе, скорость плавает день ко дню) → клиент шлёт id **батчами по `ID_CHUNK=5`** и склеивает.
 - **Охват (`amountIFA`) неаддитивен** — только накопительно за `[global_start_date, D]`, не сумма по дням,
   и только из метода `campaigns-statistics` (в `campaign-list` = 0; в `daily` — фиктивная константа).
 - **`URL` в статистике по баннерам не уникален** за день → агрегировать суммой по `(date, URL)`.
