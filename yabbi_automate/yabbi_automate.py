@@ -8,7 +8,9 @@
 - get_campaign_dict()                                   — справочник кампаний
 - get_campaigns_daily_stat(date_from, date_to)          — статистика по кампаниям по дням
 - get_banners_daily_stat(date_from, date_to)            — статистика по баннерам по дням (+ campaign_id)
-- get_reach_cumulative(global_start_date, date_from, date_to) — накопительный охват по кампаниям
+
+Накопительный охват (get_reach_cumulative) перенесён в архив 2026-07-20 — пока не нужен;
+рабочий код: archive/get_reach_cumulative.py.
 
 Учётные данные читаются из окружения YABBI_LOGIN / YABBI_PASSWORD
 (или передаются явно в YabbiClient). Глобальная дата начала — YABBI_GLOBAL_START_DATE.
@@ -53,7 +55,6 @@ MSK_TZ = timezone(timedelta(hours=3))  # граница суток Yabbi — м�
 #   день, а лишь стартовый ~часовой бакет → день D забирается окном [D 00:00 МСК,
 #   D+1 00:00 МСК] с фильтром по ключу/полю дня == D (хвост D+1 отбрасывается);
 # - статистика по кампаниям/баннерам — по 1 дню за запрос (обход 16КБ-сетевого затыка);
-# - охват (reach) — накопительно за [global_start_date, конец дня D МСК] (неаддитивен);
 # - id кампаний в /report-ajax — батчами по ID_CHUNK: сервер тратит ~5-7 с на кампанию,
 #   полный список за раз в плохие дни не отвечает вовсе (замер 2026-07-04);
 # - обязателен gzip (requests шлёт Accept-Encoding: gzip и распаковывает сам).
@@ -70,8 +71,6 @@ CAMPAIGNS_DAILY_COLUMNS = [
 ]
 
 BANNERS_DAILY_COLUMNS = ["date", "campaign_id", "URL", "show", "click", "complete"]
-
-REACH_COLUMNS = ["date", "campaign_id", "name", "reach", "increment"]
 
 
 # ── Клиент ────────────────────────────────────────────────────────────────────
@@ -192,20 +191,6 @@ class YabbiClient:
             )
             for day, rows in (data if isinstance(data, dict) else {}).items():
                 out.setdefault(day, []).extend(rows or [])
-        return out
-
-    def fetch_campaigns_statistics_total(
-        self, campaign_ids: list[str], start_ms: int, end_ms: int
-    ) -> list[dict[str, Any]]:
-        """Итог по кампаниям за период (несёт охват amountIFA). id — батчами по ID_CHUNK."""
-        out: list[dict[str, Any]] = []
-        for chunk in _chunks(campaign_ids, ID_CHUNK):
-            data = self._get_json(
-                "/report-ajax",
-                {"method": "campaigns-statistics", "startTime": start_ms,
-                 "endTime": end_ms, "id": ",".join(chunk)},
-            )
-            out.extend(data if isinstance(data, list) else [])
         return out
 
     def fetch_per_banners_per_days(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
@@ -423,69 +408,3 @@ def get_banners_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
         return pd.DataFrame(columns=BANNERS_DAILY_COLUMNS)
     df = pd.DataFrame(all_rows)
     return df.reindex(columns=BANNERS_DAILY_COLUMNS).reset_index(drop=True)
-
-
-def get_reach_cumulative(
-    global_start_date: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-) -> pd.DataFrame:
-    """Накопительный охват по кампаниям (кумулятивная метрика).
-
-    Охват (amountIFA) неаддитивен → нельзя суммировать по дням. Для каждого дня D
-    из [date_from, date_to] делается ОТДЕЛЬНЫЙ запрос /report-ajax?method=campaigns-statistics
-    за период [global_start_date, D]; берётся amountIFA = накопительный охват.
-    increment = reach[D] − reach[D−1] (для первого дня = reach).
-
-    По умолчанию: global_start_date = YABBI_GLOBAL_START_DATE, date_from = та же дата,
-    date_to = вчера.
-
-    Колонки: date, campaign_id, name, reach, increment.
-    """
-    gs = global_start_date or _global_start_date()
-    date_from = date_from or gs
-    date_to = date_to or _yesterday()
-    gs_d = datetime.strptime(gs, "%Y-%m-%d").date()
-    df_d = datetime.strptime(date_from, "%Y-%m-%d").date()
-    if df_d < gs_d:
-        raise ValueError(
-            f"date_from ({date_from}) раньше глобальной даты начала ({gs}) — "
-            "накопительный охват определён только от глобальной даты начала."
-        )
-
-    client = YabbiClient()
-    dict_rows = client.fetch_campaign_list(_to_ms(gs), _end_of_day_ms(_yesterday()))
-    campaign_ids = list(dict.fromkeys(str(e["id"]) for e in dict_rows if e.get("id")))
-    name_by_id = {str(e["id"]): e.get("name") for e in dict_rows if e.get("id")}
-    if not campaign_ids:
-        return pd.DataFrame(columns=REACH_COLUMNS)
-
-    gs_ms = _to_ms(gs)
-    # Если date_from позже глобального старта — добавляем предыдущий день как baseline,
-    # чтобы increment первого дня был приростом, а не всем накопленным охватом.
-    query_days = _date_range(date_from, date_to)
-    baseline_day: str | None = None
-    if df_d > gs_d:
-        baseline_day = (df_d - timedelta(days=1)).isoformat()
-        query_days = [baseline_day] + query_days
-
-    all_rows: list[dict[str, Any]] = []
-    for day in query_days:
-        # Накопительно по КОНЕЦ дня D МСК (последняя мс дня — бакет D+1 не задевается).
-        end_ms = _end_of_day_ms(day)
-        for row in client.fetch_campaigns_statistics_total(campaign_ids, gs_ms, end_ms):
-            cid = str(row.get("id"))
-            all_rows.append({
-                "date": day, "campaign_id": cid,
-                "name": name_by_id.get(cid, row.get("name")),
-                "reach": _int(row.get("amountIFA")),
-            })
-    if not all_rows:
-        return pd.DataFrame(columns=REACH_COLUMNS)
-    df = pd.DataFrame(all_rows).sort_values(["campaign_id", "date"]).reset_index(drop=True)
-    df["increment"] = df.groupby("campaign_id")["reach"].diff()
-    # первый день ряда (от глобального старта) прироста «до» не имеет → increment = сам reach
-    df["increment"] = df["increment"].fillna(df["reach"]).astype(int)
-    if baseline_day is not None:  # baseline нужен только для расчёта, в выдачу не идёт
-        df = df[df["date"] != baseline_day].reset_index(drop=True)
-    return df.reindex(columns=REACH_COLUMNS).reset_index(drop=True)

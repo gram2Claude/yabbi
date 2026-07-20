@@ -34,7 +34,7 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
 - Все GET идут с `Accept-Encoding: gzip` (обходит сетевой затык >16 КБ; `requests` шлёт и распаковывает сам)
   и повторами с backoff.
 - Методы-обёртки: `fetch_campaign_list`, `fetch_campaigns_statistics_daily`,
-  `fetch_campaigns_statistics_total`, `fetch_per_banners_per_days`, `fetch_campaigns_banners_daily`.
+  `fetch_per_banners_per_days`, `fetch_campaigns_banners_daily`.
 
 **Публичные функции** (возвращают `pd.DataFrame`):
 
@@ -43,9 +43,12 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
 | `get_campaign_dict()` | справочник кампаний | `/ajax?method=campaign-list` |
 | `get_campaigns_daily_stat(date_from, date_to)` | кампания × день (вкл. «Видимость» = `load`) | `/report-ajax?method=campaigns-statistics-daily` |
 | `get_banners_daily_stat(date_from, date_to)` | баннер × день | `/statistics/statistics-per-banners-per-days` (+ `campaigns-banners-daily` для `campaign_id`) |
-| `get_reach_cumulative(global_start_date, date_from, date_to)` | кампания × день (накопительно) | `/report-ajax?method=campaigns-statistics` |
 
 Колонки таблиц — минимальные и фиксированные (см. `manual_forms/03_ENTITY_FUNCTIONS.md`).
+
+**Архив:** `get_reach_cumulative` (накопительный охват из `amountIFA`) выведена из библиотеки
+2026-07-20 — пока не нужна; рабочий код в `archive/get_reach_cumulative.py`, знание об
+источнике — `info/00_yabbi_source.md` §5.4.
 
 ## Ключевые правила источника (критично — легко ошибиться)
 
@@ -60,6 +63,7 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
   отвечает вовсе, скорость плавает день ко дню) → клиент шлёт id **батчами по `ID_CHUNK=5`** и склеивает.
 - **Охват (`amountIFA`) неаддитивен** — только накопительно за `[global_start_date, D]`, не сумма по дням,
   и только из метода `campaigns-statistics` (в `campaign-list` = 0; в `daily` — фиктивная константа).
+  Функция охвата — в архиве (см. выше), правило сохраняется на случай возврата.
 - **`URL` в статистике по баннерам не уникален** за день → агрегировать суммой по `(date, URL)`.
 - **Привязка баннер→кампания — через `campaigns-banners-daily`** (`url` == `URL`, → `campaign` id), НЕ парсингом URL.
 - **gzip обязателен** для больших ответов (сетевой затык >16 КБ на некоторых сетях — воспроизведён на win-vm).
