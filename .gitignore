@@ -12,3 +12,7 @@ yabbi_automate/raw_data/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Jupyter: чекпоинты и CSV-выгрузки demo-ноутбука (бизнес-данные)
+.ipynb_checkpoints/
+yabbi_automate/*.csv

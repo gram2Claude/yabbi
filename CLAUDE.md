@@ -77,6 +77,9 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
 
 ## Running
 
+Demo-ноутбук: `yabbi_automate/yabbi_automate_demo.ipynb` (сгенерирован 2026-07-20 по шаблону
+`test/auto_generated/06_template_demo.ipynb`; период по умолчанию — 1 день, `/report-ajax` медленный).
+
 Smoke (живой кабинет, нужен `.env`):
 ```python
 import sys; sys.path.insert(0, "yabbi_automate")
