@@ -414,8 +414,11 @@ def get_campaigns_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
             if stat_day != day:
                 continue
             for row in camp_rows:
+                cid = row.get("id")
+                if cid is None:  # строка без id кампании — ключ не построить (как в avito)
+                    continue
                 state = row.get("state", {}) or {}
-                rec: dict[str, Any] = {"date": stat_day, "campaign_id": str(row.get("id"))}
+                rec: dict[str, Any] = {"date": stat_day, "campaign_id": str(cid)}
                 for col, key in _DAILY_METRICS:
                     rec[col] = _num(state.get(key)) if col == "costs_nds" else _int(state.get(key))
                 all_rows.append(rec)
