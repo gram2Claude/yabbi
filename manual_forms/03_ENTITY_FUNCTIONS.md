@@ -22,8 +22,10 @@
 ```
 Тип:       Статистика (кампания × день)
 Источник:  GET /report-ajax?method=campaigns-statistics-daily&startTime&endTime&id=<csv id из справочника>
-Забор:     по 1 дню за запрос (startTime==endTime==D).
-Колонки:   date, id, name, win (показы), click, budget (₽, float),
+Забор:     по 1 дню за запрос: окно [D 00:00 МСК, D+1 00:00 МСК] + фильтр по ключу дня == D
+           (startTime==endTime даёт лишь стартовый ~часовой бакет — см. фикс 2026-07-04);
+           id — батчами по ID_CHUNK=5.
+Колонки:   date, id, name, win (показы), load (видимость), click, budget (₽, float),
            bid, auction, firstQuartile, midpoint, thirdQuartile, complete (метрики из state)
 Примечание: type/status/owner/group в этом методе пустые — берутся из справочника по id.
 ```
@@ -33,8 +35,10 @@
 ```
 Тип:       Статистика (баннер × день)
 Источник:  метрики — GET /statistics/statistics-per-banners-per-days&startTime&endTime (аккаунт целиком);
-           привязка campaign_id — GET /report-ajax?method=campaigns-banners-daily&id=<csv>  (url==URL → campaign)
-Забор:     по 1 дню за запрос ([D, D+1], фильтр по day==D — per-banners не принимает нулевой диапазон).
+           привязка campaign_id — GET /report-ajax?method=campaigns-banners-daily&id=<csv>
+           (url==URL → campaign; id — батчами по ID_CHUNK=5)
+Забор:     по 1 дню за запрос ([D 00:00 МСК, D+1 00:00 МСК], фильтр по day==D —
+           per-banners не принимает нулевой диапазон).
 Агрегация: сумма show/click/complete по (date, URL) — URL не уникален за день.
 Колонки:   date, campaign_id, URL, show, click, complete
 ```
@@ -43,9 +47,11 @@
 
 ```
 Тип:       Охват — кумулятивная метрика (кампания × день)
-Источник:  GET /report-ajax?method=campaigns-statistics&startTime=<глоб.дата начала>&endTime=D&id=<csv>
+Источник:  GET /report-ajax?method=campaigns-statistics&startTime=<глоб.дата начала 00:00 МСК>&endTime=<конец дня D МСК (последняя мс)>&id=<csv, батчами по ID_CHUNK=5>
 Логика:    охват (amountIFA) неаддитивен → на каждый день D отдельный запрос за [global_start_date, D];
            reach = amountIFA; increment = reach[D] − reach[D−1] (первый день = reach).
+           amountIFA — оценочная метрика: может проседать день-к-дню, increment иногда
+           отрицателен — это свойство источника, к 0 не клампить (см. 00_yabbi_source.md §5).
 Колонки:   date, campaign_id, name, reach, increment
 Примечание: охват есть ТОЛЬКО в методе campaigns-statistics (в campaign-list = 0; в daily — фиктивно-константный).
 ```
