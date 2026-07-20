@@ -4,7 +4,8 @@
 Цель — портировать функциональность на целевой язык (PHP / Go / Java / …) с сохранением
 структуры выходных данных. Документ самодостаточен; доступ к Python-коду не требуется.
 
-Версия документа: 2026-07-03 (черновик).
+Версия документа: **2026-07-20** (заменяет черновик 2026-07-03; семантика дат исправлена
+на московские сутки, добавлены батчинг id, стандарт колонок и обогащение).
 
 ---
 
@@ -12,18 +13,27 @@
 
 Разработать библиотеку выгрузки статистики из рекламного кабинета **Yabbi** (`my.yabbi.me`).
 У площадки **нет публичного API** — данные забираются из личного кабинета рекламодателя по
-**cookie-сессии**, а «методы» передаются в параметрах URL. Библиотека отдаёт 4 таблицы:
-справочник кампаний, статистику по кампаниям по дням, статистику по баннерам по дням и
-накопительный охват по кампаниям. Выход каждой функции — массив строк с фиксированным набором колонок.
+**cookie-сессии**, а «методы» передаются в параметрах URL. Библиотека отдаёт **3 таблицы**:
+
+1. справочник кампаний;
+2. статистику по кампаниям по дням;
+3. статистику по баннерам по дням.
+
+Выход каждой функции — массив строк (таблица) с фиксированным набором и порядком колонок (§4–5).
+
+> Накопительный охват (`amountIFA`, метод `campaigns-statistics`) в объём НЕ входит —
+> функция выведена в архив заказчика и в порт не переносится.
 
 ---
 
 ## 2. Общая логика
 
 1. **Авторизация** — один раз логинимся формой, получаем session-cookie, дальше все запросы идут с ней.
-2. **Справочник кампаний** — один запрос за окно `[глобальная дата начала, вчера]`.
-3. **Статистика** (кампании/баннеры) — **по одному дню за запрос**, склеиваем дни.
-4. **Охват** — кумулятивно: на каждый день D отдельный запрос за `[глобальная дата начала, D]`.
+2. **Справочник кампаний** — один запрос за окно `[глобальная дата начала, вчера включительно]`.
+3. **Статистика** (кампании/баннеры) — **по одному дню за запрос**, склеиваем дни;
+   id кампаний в `/report-ajax` — **батчами по 5** (§3.4).
+4. **Обогащение** — каждая таблица дополняется стандартными константными и вычисляемыми
+   полями (§4): `account_id`, `source_type_id`, `id_key_*`, для расходов — блок НДС/комиссии.
 
 ---
 
@@ -49,107 +59,213 @@
 | `/ajax?method=campaign-list&startTime&endTime&status=all&type=all` | справочник кампаний |
 | `/report-ajax?method=campaigns-statistics-daily&startTime&endTime&id=<csv>` | кампании × день |
 | `/statistics/statistics-per-banners-per-days?startTime&endTime` | баннеры × день (аккаунт целиком) |
-| `/report-ajax?method=campaigns-banners-daily&startTime&endTime&id=<csv>` | баннеры × день с привязкой к кампании |
-| `/report-ajax?method=campaigns-statistics&startTime&endTime&id=<csv>` | итог по кампаниям (несёт охват) |
+| `/report-ajax?method=campaigns-banners-daily&startTime&endTime&id=<csv>` | привязка баннер → кампания |
 
-`id` — список ID кампаний через запятую (из справочника).
+`id` — список ID кампаний через запятую (из справочника), **батчами** (§3.4).
 
-### 3.3. Даты — критично
+### 3.3. Даты — КРИТИЧНО (московские сутки)
 
-- `startTime` / `endTime` — **Unix-время в миллисекундах** (секунды × 1000; полночь UTC).
-- ⚠️ **`endTime` ВКЛЮЧАЕТ свой день.** Для одного дня D:
-  - `campaigns-statistics-daily`: `startTime == endTime == D` (вернёт только D);
-  - `statistics-per-banners-per-days`: **`[D, D+1]`** — этот метод **отвергает нулевой диапазон**
-    (`startTime==endTime` → `400`); из ответа брать только строки с `day == D`;
-  - охват: `endTime = D` → накопительно за `[глобальная дата начала, D]`.
+- `startTime` / `endTime` — **Unix-время в миллисекундах**.
+- **Сутки Yabbi бакетируются по МОСКОВСКОЙ полуночи (UTC+3), НЕ по UTC.** Все границы дней
+  считать в таймзоне `Europe/Moscow`: полночь дня D МСК = `D 00:00:00+03:00 → мс`.
+  (Полночь UTC сдвигает окно на 3 часа: дневной бакет теряет 00:00–03:00 МСК,
+  цифры расходятся с кабинетом — проверено сверкой.)
+- ⚠️ **`startTime == endTime` возвращает НЕ весь день, а лишь стартовый ~часовой бакет**
+  (занижение в 15–20 раз; кампании без ночного трафика выпадают вовсе). Правило для одного дня D:
+  - `campaigns-statistics-daily` и `campaigns-banners-daily`: окно
+    **`[D 00:00 МСК, D+1 00:00 МСК]`**; ответ keyed по датам — **брать только ключ `D`**,
+    хвостовой бакет `D+1` отбрасывать;
+  - `statistics-per-banners-per-days`: то же окно `[D, D+1]` (метод **отвергает нулевой
+    диапазон** — `startTime==endTime` → `400`); из ответа брать только строки с `day == D`;
+  - справочник `campaign-list`: `startTime` = глобальная дата начала (00:00 МСК),
+    `endTime` = **конец вчерашнего дня МСК** (последняя мс дня, т.е. `полночь сегодня МСК − 1 мс`).
 - Пустой период → тело `null` (для per-banners) — трактовать как «нет данных».
 
-### 3.4. Сжатие и надёжность
+### 3.4. Медленный `/report-ajax` — id батчами
+
+- `/report-ajax` тратит **~5–7 секунд НА КАЖДУЮ кампанию** из параметра `id`; полный список
+  (40+ id) одним запросом в плохие дни не отвечает вовсе (скорость плавает день ко дню).
+- Поэтому id кампаний передавать **батчами по `ID_CHUNK = 5`** (каждая кампания ровно в одном
+  батче), ответы склеивать (для keyed-ответов — слияние по датным ключам).
+- Таймаут запроса — крупный: **180 сек** (батч из 5 id — ~30–35 с, с запасом).
+
+### 3.5. Сжатие и надёжность
 
 - **Обязательно `Accept-Encoding: gzip`.** Помимо экономии, это обходит сетевой затык: на части сетей
   несжатые ответы >~16 КБ «зависают» (воспроизведено). Клиент, посылающий gzip и распаковывающий ответ,
   проблемы не имеет (в большинстве HTTP-библиотек — по умолчанию).
 - Явных rate-limit не наблюдалось; при сетевой ошибке/таймауте/протухшей сессии — повтор с
   экспоненциальным backoff (старт 2 сек, до 5 повторов) и перелогином.
-- Таймаут запроса — крупный (эндпоинты медленные): 120 сек.
 
-### 3.5. Подводные камни данных
+### 3.6. Подводные камни данных
 
-- **Деньги (`budget`) — десятичные ₽** (float), в отличие от целочисленных денег некоторых площадок.
-- **Охват (`amountIFA`) неаддитивен** (уникальные пользователи): **нельзя суммировать по дням**; берётся
-  только накопительно и только из метода `campaigns-statistics` (в `campaign-list` = 0; в
-  `campaigns-statistics-daily` приходит фиктивной константой по всем дням — не использовать).
-- **`URL` баннера не уникален** за день: одна ссылка встречается несколькими строками (разные баннеры) →
-  агрегировать суммой по `(day, URL)`.
-- **Привязка баннера к кампании** — НЕ парсингом URL (в `URL` зашит код медиаплана, а не имя кампании;
-  у части ссылок, напр. `yandex.maps`, меток нет вовсе). Использовать `campaigns-banners-daily`, где у
-  баннера есть `url` (посимвольно = `URL`) и `campaign` (id) → джойн к справочнику.
-- В `campaigns-statistics-daily` поля `type`/`status`/`owner`/`group` **пустые** — брать из справочника по `id`.
-
----
-
-## 4. Публичные функции (контракты)
-
-### 4.1. get_campaign_dict() — справочник кампаний
-
-`GET /ajax?method=campaign-list&startTime=<глоб.дата начала>&endTime=<вчера>&status=all&type=all`.
-Дедупликация по `id`. **5 колонок:**
-
-| Поле | Тип | Источник |
-|------|-----|----------|
-| `id` | string | `id` (ObjectId) |
-| `name` | string | `name` |
-| `type` | string | `type` (`rtb`=баннер / `vast`=видео) |
-| `bidType` | string | `bidType` (`click`/`show`) |
-| `status` | string | `status` (`active`/`stopped`/`paused`) |
-
-### 4.2. get_campaigns_daily_stat(date_from, date_to) — кампания × день
-
-Перебор дней; на каждый день — `GET /report-ajax?method=campaigns-statistics-daily&startTime=D&endTime=D&id=<все id>`.
-Ответ — объект `{ "YYYY-MM-DD": [ {кампания, state}, … ] }`. **12 колонок:**
-`date`, `id`, `name`, и из `state`: `win` (показы), `click`, `budget` (₽, float, округл. 2),
-`bid`, `auction`, `firstQuartile`, `midpoint`, `thirdQuartile`, `complete` (видео 25/50/75/100%; у баннеров = 0).
-
-### 4.3. get_banners_daily_stat(date_from, date_to) — баннер × день
-
-На каждый день D:
-- метрики — `GET /statistics/statistics-per-banners-per-days?startTime=D&endTime=D+1`, оставить `day==D`,
-  агрегировать суммой по `URL`;
-- `campaign_id` — из `GET /report-ajax?method=campaigns-banners-daily&startTime=D&endTime=D+1&id=<все id>`
-  (карта `url → campaign`).
-
-**6 колонок:** `date`, `campaign_id`, `URL`, `show`, `click`, `complete`.
-
-### 4.4. get_reach_cumulative(global_start_date, date_from, date_to) — накопительный охват
-
-На каждый день D: `GET /report-ajax?method=campaigns-statistics&startTime=<глоб.дата начала>&endTime=D&id=<все id>`;
-`reach = amountIFA`. **5 колонок:** `date`, `campaign_id`, `name`, `reach`, `increment`, где
-`increment[D] = reach[D] − reach[D−1]`.
-> ⚠️ `date_from` должен быть ≥ глобальной даты начала. Если `date_from` = глобальной дате начала — для
-> первого дня `increment = reach` (прироста «до» нет). Если `date_from` **позже** — для корректного
-> `increment` первого дня взять baseline: `reach` за `(date_from − 1)` и вычесть его. Иначе первая строка
-> получит весь накопленный охват вместо дневного прироста.
-> ⚠️ `amountIFA` — **оценочная (модельная) метрика** и может немного проседать день-к-дню, поэтому
-> накопительный `reach` НЕ строго монотонен, а `increment` **иногда отрицателен** (реальный пример:
-> Перекрёсток 07-01 `78469` → 07-02 `75126`, `increment = −3343`). Это нормально — к 0 не клампить.
+- **Маппинг метрик на кабинет («Мои кампании»), сверено до единицы:**
+  «Показы» = `state.win`, «Видимость» = `state.load`, «Клики» = `state.click`;
+  CTR кабинета = `click / win`. ⚠️ Поле `state.view` — это **НЕ** «Видимость»
+  (оно чуть больше `load`) — не использовать.
+- **Деньги (`state.budget`) — десятичные ₽** (float). ⚠️ **Расход Yabbi — БЕЗ НДС** (см. §4.3).
+- **`URL` баннера не уникален** за день: одна ссылка встречается несколькими строками (разные
+  баннеры) → агрегировать суммой по `(day, URL)`.
+- **Привязка баннера к кампании** — НЕ парсингом URL (в `URL` зашит код медиаплана, а не имя
+  кампании; у части ссылок, напр. `yandex.maps`, меток нет вовсе). Использовать
+  `campaigns-banners-daily`, где у баннера есть `url` (посимвольно = `URL`) и `campaign` (id).
+- В `campaigns-statistics-daily` поля `type`/`status`/`owner`/`group` **пустые** — при
+  необходимости брать из справочника по id кампании.
+- **ID кампании — строка** (Mongo ObjectId, напр. `69cf967d4fda22c9bfa33a69`) — не приводить к числу.
 
 ---
 
-## 5. Алгоритм (общий шаблон)
+## 4. Стандарт выходных таблиц (нейминг + обогащение)
+
+### 4.1. Нейминг
+
+Все имена колонок — **snake_case, английский**. Дата = `date` (`YYYY-MM-DD`, день метрик).
+Идентификаторы — с суффиксом `_id` (голого `id` в выходных таблицах нет). Метрики:
+показы → `impressions`, клики → `clicks`, расход → `costs_nds`,
+видео-досмотры 25/50/75/100% → `video_views_25` / `video_views_50` / `video_views_75` / `video_views_100`.
+Имён кампаний в таблицах статистики **нет** — только в справочнике (join по `campaign_id`).
+
+### 4.2. Обязательное обогащение (константы и ключи)
+
+Каждая таблица дополняется полями (значения констант — **заглушки, заменяются при интеграции**;
+вынести в конфиг/константы модуля):
+
+| Константа | Значение-заглушка | Куда идёт |
+|---|---|---|
+| `account_id` | `1` (integer) | все таблицы |
+| `source_type_id` | `9` (integer) | все таблицы |
+| `product_id` | `1` (integer) | только справочник |
+| `product_name` | `"prod_test"` (string) | только справочник |
+| `camp_type` | `"camp_test"` (string) | только справочник |
+| `camp_category` | `"cat_test"` (string) | только справочник |
+| `owner_id` | `1` (integer) | только справочник |
+| `ak` | `0.5` (float, агентская комиссия 50%) | статистика кампаний |
+
+Составные ключи (string, разделитель `_`):
+
+- `id_key_camp = "<account_id>_" + campaign_id` → напр. `1_69cf967d4fda22c9bfa33a69`.
+  ⚠️ Префикс собирать **из константы `account_id`**, не хардкодить литерал `"1_"`.
+- `id_key_ad = id_key_camp + "_" + url` — только в таблице баннеров (своего id у баннера
+  в Yabbi нет, идентификатор — `url`; ключ получается длинным — это нормально).
+  Для баннера без найденной кампании `campaign_id`, `id_key_camp`, `id_key_ad` = `null`.
+
+### 4.3. Деньги и НДС (только статистика кампаний)
+
+- `costs_nds` ← `state.budget`: **float, округление до 2 знаков сразу после чтения**,
+  до вычисления производных.
+- ⚠️ **Yabbi отдаёт расход БЕЗ НДС.** По конвенции пайплайна колонка всё равно называется
+  `costs_nds` и хранит значение источника КАК ЕСТЬ (единый контракт всех источников заказчика;
+  семантическая оговорка фиксируется в README порта). Производные считаются единой формулой:
+- `costs_without_nds = costs_nds / делитель_НДС`, где делитель зависит от **года** значения
+  `date` строки: год ≥ 2026 → `1.22` (ставка 22%), год < 2026 → `1.20` (20%). Считать per-row.
+- `costs_nds_ak = costs_nds × (1 + ak)` = `costs_nds × 1.5`.
+- `costs_without_nds_ak = costs_without_nds × (1 + ak)`.
+- Производные не округлять (только `costs_nds` — round 2).
+
+---
+
+## 5. Публичные функции (контракты)
+
+### 5.1. get_campaign_dict() — справочник кампаний
+
+`GET /ajax?method=campaign-list&startTime=<глоб. дата начала 00:00 МСК>&endTime=<конец вчера МСК>&status=all&type=all`.
+Дедупликация по `campaign_id` (выживает первая строка). **13 колонок (порядок фиксирован):**
+
+| # | Колонка | Тип | Источник |
+|---|---------|-----|----------|
+| 1 | `campaign_id` | string | `id` (ObjectId) |
+| 2 | `campaign_name` | string | `name` |
+| 3 | `campaign_type` | string | `type` (`rtb`=баннер / `vast`=видео) |
+| 4 | `bid_type` | string | `bidType` (`click`/`show`) |
+| 5 | `status` | string | `status` (`active`/`stopped`/`paused`) |
+| 6 | `account_id` | integer | константа |
+| 7 | `source_type_id` | integer | константа |
+| 8 | `product_id` | integer | константа |
+| 9 | `product_name` | string | константа |
+| 10 | `camp_type` | string | константа |
+| 11 | `camp_category` | string | константа |
+| 12 | `id_key_camp` | string | `"<account_id>_" + campaign_id` |
+| 13 | `owner_id` | integer | константа |
+
+### 5.2. get_campaigns_daily_stat(date_from, date_to) — кампания × день
+
+Перебор дней; на каждый день D — `GET /report-ajax?method=campaigns-statistics-daily` с окном
+`[D 00:00 МСК, D+1 00:00 МСК]` и `id=<батч из 5>` (кол-во запросов на день = ⌈N кампаний / 5⌉).
+Ответ — объект `{ "YYYY-MM-DD": [ {кампания, state}, … ] }` — **брать только ключ `D`**.
+Строки без id кампании пропускать. **19 колонок (порядок фиксирован):**
+
+| # | Колонка | Тип | Источник |
+|---|---------|-----|----------|
+| 1 | `date` | date | ключ объекта ответа (`YYYY-MM-DD`) |
+| 2 | `campaign_id` | string | `id` |
+| 3 | `impressions` | int | `state.win` («Показы» кабинета) |
+| 4 | `load` | int | `state.load` («Видимость» кабинета; аналога в стандарте нет — имя источника) |
+| 5 | `clicks` | int | `state.click` |
+| 6 | `costs_nds` | float | `state.budget`, round 2 (⚠ БЕЗ НДС, §4.3) |
+| 7 | `bid` | int | `state.bid` (участия в торгах) |
+| 8 | `auction` | int | `state.auction` |
+| 9 | `video_views_25` | int | `state.firstQuartile` (0 у rtb, >0 у vast) |
+| 10 | `video_views_50` | int | `state.midpoint` |
+| 11 | `video_views_75` | int | `state.thirdQuartile` |
+| 12 | `video_views_100` | int | `state.complete` |
+| 13 | `costs_without_nds` | float | вычисление §4.3 |
+| 14 | `ak` | float | константа |
+| 15 | `costs_nds_ak` | float | вычисление §4.3 |
+| 16 | `costs_without_nds_ak` | float | вычисление §4.3 |
+| 17 | `account_id` | integer | константа |
+| 18 | `source_type_id` | integer | константа |
+| 19 | `id_key_camp` | string | §4.2 |
+
+### 5.3. get_banners_daily_stat(date_from, date_to) — баннер × день
+
+На каждый день D (окна — `[D 00:00 МСК, D+1 00:00 МСК]`):
+
+- метрики — `GET /statistics/statistics-per-banners-per-days`, оставить строки `day == D`,
+  строки без `URL` пропустить, агрегировать **суммой** `show`/`click`/`complete` по `URL`;
+- карта `url → campaign` — `GET /report-ajax?method=campaigns-banners-daily&id=<батчи по 5>`,
+  брать только ключ `D`; привязка: `per-banners.URL == campaigns-banners-daily.url` → `campaign`.
+
+**10 колонок (порядок фиксирован):**
+
+| # | Колонка | Тип | Источник |
+|---|---------|-----|----------|
+| 1 | `date` | date | `day` |
+| 2 | `campaign_id` | string / null | карта `url → campaign` |
+| 3 | `url` | string | `URL` (идентификатор баннера) |
+| 4 | `impressions` | int | Σ `show` по `(date, url)` |
+| 5 | `clicks` | int | Σ `click` |
+| 6 | `video_views_100` | int | Σ `complete` (досмотры видео 100%) |
+| 7 | `account_id` | integer | константа |
+| 8 | `source_type_id` | integer | константа |
+| 9 | `id_key_camp` | string / null | §4.2 (null, если кампания не найдена) |
+| 10 | `id_key_ad` | string / null | `id_key_camp + "_" + url` (null, если кампания не найдена) |
+
+Расходов на уровне баннера у источника нет → денежный блок (§4.3) не применяется.
+
+---
+
+## 6. Алгоритм (общий шаблон)
 
 ```
 1. login() → session-cookie (форма + Referer/Origin). Перелогин по TTL / {"err": "no access"}.
-2. Справочник: GET campaign-list [глоб.дата начала, вчера] → список кампаний, дедуп по id.
-3. Статистика по дням: для каждого дня D — 1 запрос (endTime по правилам §3.3), развернуть, склеить.
-4. Охват: для каждого дня D — запрос за [глоб.дата начала, D], взять amountIFA, посчитать increment.
-5. Все запросы — с gzip и ретраями; ответ null/{} → нет данных.
+2. Справочник: GET campaign-list [глоб. дата начала 00:00 МСК, конец вчера МСК] →
+   список кампаний, дедуп по id → campaign_ids.
+3. Статистика по дням: для каждого дня D — запросы с окном [D, D+1] МСК
+   (report-ajax — батчами id по 5), из ответа только день D, склеить.
+4. Переименовать поля по контрактам §5, добавить обогащение §4.
+5. Все запросы — с gzip и ретраями; ответ null/{} → нет данных (вернуть пустую таблицу
+   с полным набором колонок).
 ```
 
 ---
 
-## 6. Примеры запросов и ответов (реальные)
+## 7. Примеры запросов и ответов (реальные)
 
-### 6.1. Логин
+Все таймстампы — **московские полуночи**: `2026-07-01 00:00 МСК = 1782853200000`,
+`2026-07-02 00:00 МСК = 1782939600000`, `2026-06-01 00:00 МСК = 1780261200000`,
+конец дня 2026-07-01 МСК = `1782939599999`.
+
+### 7.1. Логин
 ```
 POST https://my.yabbi.me/login?method=account
 Content-Type: application/x-www-form-urlencoded
@@ -160,88 +276,83 @@ login=<LOGIN>&password=<PASSWORD>
 → 302 на /campaign?method=list; Set-Cookie: as-account-session=…; Max-Age=3600
 ```
 
-### 6.2. Справочник кампаний
+### 7.2. Справочник кампаний (окно [глоб. дата начала, конец вчера МСК])
 ```
-GET /ajax?method=campaign-list&startTime=1780272000000&endTime=1782777600000&status=all&type=all
+GET /ajax?method=campaign-list&startTime=1780261200000&endTime=1782939599999&status=all&type=all
 → [ { "id":"69cf967d4fda22c9bfa33a69", "name":"Перекрёсток_Усиление Select_apr-aug_2026",
       "type":"rtb", "bidType":"show", "status":"active", "state":{…}, … }, … ]
 ```
 
-### 6.3. Кампании × день
+### 7.3. Кампании × день (окно [D, D+1] МСК; id — батч ≤5)
 ```
-GET /report-ajax?method=campaigns-statistics-daily&startTime=1782864000000&endTime=1782864000000&id=69cf967d…
+GET /report-ajax?method=campaigns-statistics-daily&startTime=1782853200000&endTime=1782939600000&id=69cf967d…,6a0c5cbf…
 → { "2026-07-01": [ { "id":"69cf967d…", "name":"Перекрёсток…",
-      "state": { "win":294, "click":0, "budget":7.49, "bid":410, "auction":410,
-                 "firstQuartile":0,"midpoint":0,"thirdQuartile":0,"complete":0, … } } ] }
+      "state": { "win":4958, "load":4931, "click":42, "budget":198.22, "bid":8670, "auction":8670,
+                 "firstQuartile":0,"midpoint":0,"thirdQuartile":0,"complete":0, … } } ],
+    "2026-07-02": [ … хвостовой бакет — ОТБРОСИТЬ … ] }
 ```
 
-### 6.4. Баннеры × день
+### 7.4. Баннеры × день
 ```
-GET /statistics/statistics-per-banners-per-days?startTime=1782864000000&endTime=1782950400000
+GET /statistics/statistics-per-banners-per-days?startTime=1782853200000&endTime=1782939600000
 → [ { "day":"2026-07-01", "URL":"https://trk.mail.ru/c/olnrs6?…", "show":17840, "click":119, "complete":0 }, … ]
 
-GET /report-ajax?method=campaigns-banners-daily&startTime=…&endTime=…&id=<csv>
+GET /report-ajax?method=campaigns-banners-daily&startTime=1782853200000&endTime=1782939600000&id=<батч>
 → { "2026-07-01": [ { "id":"…", "campaign":"6a0c6fea…", "url":"https://trk.mail.ru/c/olnrs6?…", "state":{…} }, … ] }
 ```
 
-### 6.5. Охват (накопительно)
-```
-GET /report-ajax?method=campaigns-statistics&startTime=1780272000000&endTime=1782864000000&id=<csv>
-→ [ { "id":"69cf967d…", "amountIFA":78469, "state":{…} }, … ]
-(1780272000000 = 2026-06-01, 1782864000000 = 2026-07-01; amountIFA — накопительно за [06-01, 07-01])
-```
+---
+
+## 8. Примеры таблиц на выходе (реальные строки, 2026-07-01)
+
+### 8.1. get_campaign_dict
+| campaign_id | campaign_name | campaign_type | bid_type | status | account_id | source_type_id | product_id | product_name | camp_type | camp_category | id_key_camp | owner_id |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 69cf967d4fda22c9bfa33a69 | Перекрёсток_Усиление Select_apr-aug_2026 | rtb | show | active | 1 | 9 | 1 | prod_test | camp_test | cat_test | 1_69cf967d4fda22c9bfa33a69 | 1 |
+| 69a5819293bf90dfd5b7dff7 | Чижик_mar-apr_2026 OLV | vast | show | stopped | 1 | 9 | 1 | prod_test | camp_test | cat_test | 1_69a5819293bf90dfd5b7dff7 | 1 |
+
+### 8.2. get_campaigns_daily_stat
+| date | campaign_id | impressions | load | clicks | costs_nds | bid | auction | video_views_25 | video_views_50 | video_views_75 | video_views_100 | costs_without_nds | ak | costs_nds_ak | costs_without_nds_ak | account_id | source_type_id | id_key_camp |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-07-01 | 69cf967d4fda22c9bfa33a69 | 4958 | 4931 | 42 | 198.22 | 8670 | 8670 | 0 | 0 | 0 | 0 | 162.47541 | 0.5 | 297.33 | 243.713115 | 1 | 9 | 1_69cf967d4fda22c9bfa33a69 |
+
+### 8.3. get_banners_daily_stat
+| date | campaign_id | url | impressions | clicks | video_views_100 | account_id | source_type_id | id_key_camp | id_key_ad |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-07-01 | 6a452cec175b4776e85f9e45 | https://eye.targetads.io/view/click?pid=12795&cn=36058&… | 59120 | 634 | 49490 | 1 | 9 | 1_6a452cec175b4776e85f9e45 | 1_6a452cec175b4776e85f9e45_https://eye.targetads.io/view/click?pid=12795&cn=36058&… |
 
 ---
 
-## 7. Примеры таблиц на выходе (реальные строки)
-
-### 7.1. get_campaign_dict
-| id | name | type | bidType | status |
-|---|---|---|---|---|
-| 69cf967d4fda22c9bfa33a69 | Перекрёсток_Усиление Select_apr-aug_2026 | rtb | show | active |
-| 69a5819293bf90dfd5b7dff7 | Чижик_mar-apr_2026 OLV | vast | show | stopped |
-
-### 7.2. get_campaigns_daily_stat
-| date | id | name | win | click | budget | bid | auction | firstQuartile | midpoint | thirdQuartile | complete |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 2026-07-01 | 6a0c6fea… | Пятёрочка_Гарантия низкой цены_may-jul'26 | 850 | 6 | 24.32 | 1680 | 1680 | 0 | 0 | 0 | 0 |
-
-### 7.3. get_banners_daily_stat
-| date | campaign_id | URL | show | click | complete |
-|---|---|---|---|---|---|
-| 2026-07-01 | 6a0c5cbf… | https://trk.mail.ru/c/olnrs6?…aud_other | 8195 | 98 | 0 |
-
-### 7.4. get_reach_cumulative
-| date | campaign_id | name | reach | increment |
-|---|---|---|---|---|
-| 2026-06-29 | 69cf967d… | Перекрёсток_Усиление Select_apr-aug_2026 | 68811 | 3481 |
-| 2026-06-30 | 69cf967d… | Перекрёсток_Усиление Select_apr-aug_2026 | 74975 | 6164 |
-| 2026-07-01 | 69cf967d… | Перекрёсток_Усиление Select_apr-aug_2026 | 78469 | 3494 |
-
-> Пример при `date_from = 2026-06-29` (> глобальной даты начала 2026-06-01): `increment` первого дня =
-> прирост за день (`reach[06-29] − reach[06-28]` через baseline), а не весь накопленный охват. Если бы
-> `date_from` = глобальной дате начала, для первого дня `increment` = `reach`.
-
----
-
-## 8. Рекомендации по реализации
+## 9. Рекомендации по реализации
 
 - **HTTP-клиент** с session-хранилищем cookie, автоматическим gzip и retry-middleware.
-- **Логин**: форма + заголовки Referer/Origin; кэшировать сессию, перелогинивать по TTL (~1 ч) и на `{"err":…}`.
-- **Даты**: строго по §3.3 (единица — мс; `endTime` инклюзивный; per-banners — `[D, D+1]` + фильтр по `day`).
-- **Охват**: только накопительно, из `campaigns-statistics`; не суммировать по дням.
+- **Логин**: форма + заголовки Referer/Origin; кэшировать сессию, перелогинивать по TTL (~1 ч,
+  с запасом ~2 мин) и на `{"err": …}`.
+- **Даты**: строго §3.3 — единица мс, границы по МСК; окно дня `[D, D+1]` + фильтр по дню;
+  `startTime==endTime` НЕ использовать никогда.
+- **Батчинг**: id в `/report-ajax` — по 5; keyed-ответы сливать по датным ключам.
 - **Баннер→кампания**: только через `campaigns-banners-daily` (`url`==`URL`), не парсить URL.
-- **Забор по дням** для статистики; крупные ответы держать малыми (gzip + по 1 дню).
-- **Константы:** `HTTP_TIMEOUT_SEC=120`, `RETRY_MAX=5`, `RETRY_BASE_SEC=2`, `SESSION_TTL_SEC=3600`.
+- **Константы:** `HTTP_TIMEOUT_SEC=180`, `RETRY_MAX=5`, `RETRY_BASE_SEC=2`,
+  `SESSION_TTL_SEC=3600`, `SESSION_REFRESH_LEEWAY_SEC=120`, `ID_CHUNK=5`
+  + константы обогащения §4.2 (в конфиге, заглушки).
+- **Обогащение** — применять до финального упорядочивания колонок; порядок колонок = §5.
 
 ---
 
-## 9. Критерии приёмки
+## 10. Критерии приёмки
 
-- [ ] Все 4 функции возвращают колонки и порядок из §4.
-- [ ] Логин формой с Referer/Origin; сессия автоматически переустанавливается при истечении.
-- [ ] Даты: `endTime` инклюзивный учтён; per-banners не падает на одном дне; охват накопительный (монотонный).
-- [ ] Охват берётся из `campaigns-statistics` и НЕ суммируется по дням.
-- [ ] `URL` агрегируется суммой по `(date, URL)`; `campaign_id` проставляется из `campaigns-banners-daily`.
+- [ ] Все 3 функции возвращают колонки, типы и порядок ровно по §5 (включая обогащение §4).
+- [ ] Логин формой с Referer/Origin; сессия автоматически переустанавливается (TTL, `{"err": …}`).
+- [ ] Даты: границы суток — московские; день забирается окном `[D, D+1]` с фильтром по дню;
+  per-banners не падает на одном дне; `startTime==endTime` нигде не используется.
+- [ ] id в `/report-ajax` уходят батчами ≤5; полная выгрузка дня на 40+ кампаниях не «висит».
+- [ ] **Контрольная сверка за 2026-07-01** (`impressions / load / clicks`, до единицы):
+  «Пятёрочка_Fame to Flame_jul_2026» = 348563 / 324747 / 2179;
+  «Перекрёсток_Усиление Select_apr-aug_2026» = 4958 / 4931 / 42;
+  «Чижик_Имидж_jul_2026» = 59120 / 53513 / 634. Денежный блок: `costs_without_nds = costs_nds/1.22`,
+  `costs_nds_ak = costs_nds·1.5` (проверить на любой строке).
+- [ ] Баннеры: агрегация суммой по `(date, url)`; `campaign_id` — из `campaigns-banners-daily`;
+  у баннеров без кампании `campaign_id`/`id_key_camp`/`id_key_ad` = null (не строка "None").
 - [ ] gzip включён; крупные выгрузки не «висят».
-- [ ] README + `.env.example` (`YABBI_LOGIN`, `YABBI_PASSWORD`, `YABBI_GLOBAL_START_DATE`).
+- [ ] README + `.env.example` (`YABBI_LOGIN`, `YABBI_PASSWORD`, `YABBI_GLOBAL_START_DATE`);
+  в README зафиксирована оговорка §4.3 (расход Yabbi — без НДС, `costs_nds` хранит как есть).
