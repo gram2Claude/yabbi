@@ -44,7 +44,13 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
 | `get_campaigns_daily_stat(date_from, date_to)` | кампания × день (вкл. «Видимость» = `load`) | `/report-ajax?method=campaigns-statistics-daily` |
 | `get_banners_daily_stat(date_from, date_to)` | баннер × день | `/statistics/statistics-per-banners-per-days` (+ `campaigns-banners-daily` для `campaign_id`) |
 
-Колонки таблиц — минимальные и фиксированные (см. `manual_forms/03_ENTITY_FUNCTIONS.md`).
+Колонки — **по стандарту avito** (с 2026-07-20): snake_case, показы=`impressions`,
+клики=`clicks`, расход=`costs_nds`, видео=`video_views_25/50/75/100`; сквозное обогащение
+`account_id`/`source_type_id`/`id_key_camp`(/`id_key_ad`) + денежный блок
+`costs_without_nds`/`ak`/`costs_nds_ak`/`costs_without_nds_ak` (константы — заглушки как в avito).
+Сводка стандарта — `info/00_yabbi_source.md` §5.0; списки колонок — `manual_forms/03_ENTITY_FUNCTIONS.md`.
+⚠ `campaign_id` — строка (ObjectId, не int64); имён кампаний в статистике нет (join со справочником);
+`budget` Yabbi — БЕЗ НДС (`costs_nds` хранит значение источника как есть — конвенция имени).
 
 **Архив:** `get_reach_cumulative` (накопительный охват из `amountIFA`) выведена из библиотеки
 2026-07-20 — пока не нужна; рабочий код в `archive/get_reach_cumulative.py`, знание об
@@ -58,7 +64,8 @@ YABBI_GLOBAL_START_DATE=2026-06-01   # startTime справочника и на�
   дня `== D`** (daily и per-banners одинаково; per-banners нулевой диапазон отвергает `400`);
   охват — `endTime = конец дня D МСК` (последняя мс дня, накопительно).
 - **Кабинет ↔ `state`: «Показы» = `win`, «Видимость» = `load`, «Клики» = `click`** (CTR = click/win;
-  `view` — НЕ «Видимость», он чуть больше `load`). Сверено с кабинетом до единицы (3 кампании, 2026-07-04).
+  `view` — НЕ «Видимость», он чуть больше `load`). Сверено с кабинетом до единицы (3 кампании, 2026-07-04;
+  повторно после переименований 2026-07-20). В итоговых таблицах: `win`→`impressions`, `click`→`clicks`.
 - **`/report-ajax` тратит ~5–7 с НА КАЖДУЮ кампанию из `id`** (в плохие дни полный список из 41 id не
   отвечает вовсе, скорость плавает день ко дню) → клиент шлёт id **батчами по `ID_CHUNK=5`** и склеивает.
 - **Охват (`amountIFA`) неаддитивен** — только накопительно за `[global_start_date, D]`, не сумма по дням,

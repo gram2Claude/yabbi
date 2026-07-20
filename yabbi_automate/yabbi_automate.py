@@ -9,8 +9,14 @@
 - get_campaigns_daily_stat(date_from, date_to)          — статистика по кампаниям по дням
 - get_banners_daily_stat(date_from, date_to)            — статистика по баннерам по дням (+ campaign_id)
 
+Нейминг колонок и обогащение — по стандарту проекта 14_avito (snake_case, impressions/
+clicks/costs_nds, video_views_*, константы account_id/source_type_id/…, ключи id_key_*,
+денежный блок costs_without_nds/ak/costs_nds_ak/costs_without_nds_ak). Приведено 2026-07-20.
+⚠ Отличия от avito: campaign_id — строка (Mongo ObjectId, не int64); budget Yabbi — БЕЗ НДС
+(costs_nds хранит значение источника, см. докстринг get_campaigns_daily_stat).
+
 Накопительный охват (get_reach_cumulative) перенесён в архив 2026-07-20 — пока не нужен;
-рабочий код: archive/get_reach_cumulative.py.
+рабочий код: archive/get_reach_cumulative.py (при возврате — привести к этому же стандарту).
 
 Учётные данные читаются из окружения YABBI_LOGIN / YABBI_PASSWORD
 (или передаются явно в YabbiClient). Глобальная дата начала — YABBI_GLOBAL_START_DATE.
@@ -50,6 +56,17 @@ ID_CHUNK = 5                    # id кампаний на один запрос
 
 MSK_TZ = timezone(timedelta(hours=3))  # граница суток Yabbi — московская полночь
 
+# ── Обогащение DataFrame (соглашение проекта; эталон — 14_avito) ──────────────
+# Значения — заглушки «заменить при интеграции» (те же, что в avito_performance).
+ACCOUNT_ID = 1
+SOURCE_TYPE_ID = 9
+PRODUCT_ID = 1
+PRODUCT_NAME = "prod_test"
+CAMP_TYPE = "camp_test"
+CAMP_CATEGORY = "cat_test"
+OWNER_ID = 1
+AK = 0.5  # агентская комиссия 50%
+
 # Правила запроса (см. info/00_yabbi_source.md, §5):
 # - сутки Yabbi бакетируются по МОСКОВСКОЙ полуночи; startTime==endTime возвращает НЕ весь
 #   день, а лишь стартовый ~часовой бакет → день D забирается окном [D 00:00 МСК,
@@ -60,17 +77,39 @@ MSK_TZ = timezone(timedelta(hours=3))  # граница суток Yabbi — м�
 # - обязателен gzip (requests шлёт Accept-Encoding: gzip и распаковывает сам).
 
 # ── Колонки итоговых DataFrame (фиксируют состав и порядок) ────────────────────
+# Нейминг и обогащение — по стандарту avito (snake_case; показы=impressions,
+# клики=clicks, расход=costs_nds, видео-досмотры=video_views_25/50/75/100).
+# campaign_id у Yabbi — строка (Mongo ObjectId), int64-каст avito неприменим.
 
-CAMPAIGN_DICT_COLUMNS = ["id", "name", "type", "bidType", "status"]
-
-CAMPAIGNS_DAILY_COLUMNS = [
-    "date", "id", "name",
-    "win", "load", "click", "budget",
-    "bid", "auction",
-    "firstQuartile", "midpoint", "thirdQuartile", "complete",
+CAMPAIGN_DICT_COLUMNS = [
+    "campaign_id", "campaign_name", "campaign_type", "bid_type", "status",
+    "account_id", "source_type_id", "product_id", "product_name",
+    "camp_type", "camp_category", "id_key_camp", "owner_id",
 ]
 
-BANNERS_DAILY_COLUMNS = ["date", "campaign_id", "URL", "show", "click", "complete"]
+CAMPAIGNS_DAILY_COLUMNS = [
+    "date", "campaign_id",
+    "impressions", "load", "clicks", "costs_nds", "bid", "auction",
+    "video_views_25", "video_views_50", "video_views_75", "video_views_100",
+    "costs_without_nds", "ak", "costs_nds_ak", "costs_without_nds_ak",
+    "account_id", "source_type_id", "id_key_camp",
+]
+
+BANNERS_DAILY_COLUMNS = [
+    "date", "campaign_id", "url",
+    "impressions", "clicks", "video_views_100",
+    "account_id", "source_type_id", "id_key_camp", "id_key_ad",
+]
+
+# Метрики daily-статистики кампаний: (итоговая колонка, ключ в state ответа).
+# Маппинг на кабинет: «Показы» = win → impressions, «Видимость» = load,
+# «Клики» = click → clicks; квартили → video_views_* (как в avito).
+_DAILY_METRICS = [
+    ("impressions", "win"), ("load", "load"), ("clicks", "click"),
+    ("costs_nds", "budget"), ("bid", "bid"), ("auction", "auction"),
+    ("video_views_25", "firstQuartile"), ("video_views_50", "midpoint"),
+    ("video_views_75", "thirdQuartile"), ("video_views_100", "complete"),
+]
 
 
 # ── Клиент ────────────────────────────────────────────────────────────────────
@@ -290,6 +329,17 @@ def _chunks(items: list[str], size: int) -> list[list[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
+def _vat_divisor(date_str: str) -> float:
+    """Делитель НДС по ГОДУ даты строки: ≥2026 → 1.22 (ставка 22%), раньше → 1.20 (20%)."""
+    return 1.22 if int(date_str[:4]) >= 2026 else 1.20
+
+
+def _id_key_camp(campaign_id: Any) -> str | None:
+    """Составной ключ кампании `<account_id>_<campaign_id>` (собирается из ACCOUNT_ID,
+    а не строковым литералом — при замене заглушки меняется одно место)."""
+    return f"{ACCOUNT_ID}_{campaign_id}" if campaign_id else None
+
+
 # ── Публичные функции ─────────────────────────────────────────────────────────
 
 def get_campaign_dict() -> pd.DataFrame:
@@ -297,9 +347,12 @@ def get_campaign_dict() -> pd.DataFrame:
 
     Источник: /ajax?method=campaign-list, окно [YABBI_GLOBAL_START_DATE, вчера
     ВКЛЮЧИТЕЛЬНО (по конец дня МСК)], status=all. Ежедневно перезаписывается целиком.
-    Дедуп по `id` (выживает первая).
+    Дедуп по campaign_id (выживает первая).
 
-    Колонки: id, name, type (rtb=баннер / vast=видео), bidType (click/show), status.
+    Сырые поля: campaign_id ← id, campaign_name ← name, campaign_type ← type
+    (rtb=баннер / vast=видео), bid_type ← bidType (click/show), status.
+    Обогащение справочника — account_id, source_type_id, product_id, product_name,
+    camp_type, camp_category, id_key_camp, owner_id (константы-заглушки, как в avito).
     """
     client = YabbiClient()
     start_ms = _to_ms(_global_start_date())
@@ -307,8 +360,23 @@ def get_campaign_dict() -> pd.DataFrame:
     rows = client.fetch_campaign_list(start_ms, end_ms)
     if not rows:
         return pd.DataFrame(columns=CAMPAIGN_DICT_COLUMNS)
-    df = pd.DataFrame([{c: e.get(c) for c in CAMPAIGN_DICT_COLUMNS} for e in rows])
-    df = df.dropna(subset=["id"]).drop_duplicates(subset=["id"])
+    df = pd.DataFrame([{
+        "campaign_id": e.get("id"),
+        "campaign_name": e.get("name"),
+        "campaign_type": e.get("type"),
+        "bid_type": e.get("bidType"),
+        "status": e.get("status"),
+    } for e in rows])
+    df = df.dropna(subset=["campaign_id"]).drop_duplicates(subset=["campaign_id"])
+    df["campaign_id"] = df["campaign_id"].astype(str)
+    df["account_id"] = ACCOUNT_ID
+    df["source_type_id"] = SOURCE_TYPE_ID
+    df["product_id"] = PRODUCT_ID
+    df["product_name"] = PRODUCT_NAME
+    df["camp_type"] = CAMP_TYPE
+    df["camp_category"] = CAMP_CATEGORY
+    df["id_key_camp"] = df["campaign_id"].map(_id_key_camp)
+    df["owner_id"] = OWNER_ID
     return df.reindex(columns=CAMPAIGN_DICT_COLUMNS).reset_index(drop=True)
 
 
@@ -319,11 +387,16 @@ def get_campaigns_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
     из справочника). Забор — по одному дню, id — батчами по ID_CHUNK
     (день D = ceil(N_кампаний / ID_CHUNK) запросов).
 
-    Соответствие кабинету («Мои кампании»): «Показы» = win, «Видимость» = load,
-    «Клики» = click, CTR = click/win.
+    Соответствие кабинету («Мои кампании»): «Показы» = win → impressions,
+    «Видимость» = load, «Клики» = click → clicks, CTR = clicks/impressions.
+    Имён кампаний в статистике нет (по стандарту) — join со справочником по campaign_id.
 
-    Колонки: date, id, name, win, load, click, budget, bid, auction,
-             firstQuartile, midpoint, thirdQuartile, complete.
+    ⚠ costs_nds ← budget: Yabbi отдаёт расход БЕЗ НДС — по конвенции пайплайна
+    costs_nds хранит значение источника как есть (имя — стандарт всех выгрузок;
+    прецедент avito VIDEO_BANNER), производные считаются единой формулой.
+
+    Колонки: CAMPAIGNS_DAILY_COLUMNS (метрики + costs_without_nds, ak,
+    costs_nds_ak, costs_without_nds_ak + account_id, source_type_id, id_key_camp).
     """
     client = YabbiClient()
     dict_rows = client.fetch_campaign_list(_to_ms(_global_start_date()), _end_of_day_ms(_yesterday()))
@@ -331,8 +404,6 @@ def get_campaigns_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
     if not campaign_ids:
         return pd.DataFrame(columns=CAMPAIGNS_DAILY_COLUMNS)
 
-    metric_keys = ["win", "load", "click", "budget", "bid", "auction",
-                   "firstQuartile", "midpoint", "thirdQuartile", "complete"]
     all_rows: list[dict[str, Any]] = []
     for day in _date_range(date_from, date_to):
         # Окно [D 00:00 МСК, D+1 00:00 МСК]: startTime==endTime вернул бы лишь стартовый
@@ -344,25 +415,37 @@ def get_campaigns_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
                 continue
             for row in camp_rows:
                 state = row.get("state", {}) or {}
-                rec = {"date": stat_day, "id": row.get("id"), "name": row.get("name")}
-                for k in metric_keys:
-                    rec[k] = _num(state.get(k)) if k == "budget" else _int(state.get(k))
+                rec: dict[str, Any] = {"date": stat_day, "campaign_id": str(row.get("id"))}
+                for col, key in _DAILY_METRICS:
+                    rec[col] = _num(state.get(key)) if col == "costs_nds" else _int(state.get(key))
                 all_rows.append(rec)
     if not all_rows:
         return pd.DataFrame(columns=CAMPAIGNS_DAILY_COLUMNS)
     df = pd.DataFrame(all_rows)
-    df["budget"] = df["budget"].round(2)
+    df["costs_nds"] = df["costs_nds"].astype(float).round(2)
+    df["costs_without_nds"] = df["costs_nds"] / df["date"].map(_vat_divisor)
+    df["ak"] = AK
+    df["costs_nds_ak"] = df["costs_nds"] * (1 + AK)
+    df["costs_without_nds_ak"] = df["costs_without_nds"] * (1 + AK)
+    df["account_id"] = ACCOUNT_ID
+    df["source_type_id"] = SOURCE_TYPE_ID
+    df["id_key_camp"] = df["campaign_id"].map(_id_key_camp)
     return df.reindex(columns=CAMPAIGNS_DAILY_COLUMNS).reset_index(drop=True)
 
 
 def get_banners_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
-    """Статистика по баннерам по дням.
+    """Статистика по баннерам по дням (ad-level; идентификатор баннера — url).
 
     Источник метрик: /statistics/statistics-per-banners-per-days (аккаунт целиком),
-    агрегируется суммой по (date, URL). campaign_id обогащается через
+    агрегируется суммой по (date, url). campaign_id обогащается через
     /report-ajax?method=campaigns-banners-daily (URL == url → campaign). Забор по дням.
 
-    Колонки: date, campaign_id, URL, show, click, complete.
+    Сырые поля: impressions ← show, clicks ← click, video_views_100 ← complete.
+    Расходов на уровне баннера у источника нет → денежное обогащение не применяется.
+    id_key_ad = id_key_camp + "_" + url (своего id у баннера нет — ключ по url);
+    для баннеров без найденной кампании id_key_camp/id_key_ad = None.
+
+    Колонки: BANNERS_DAILY_COLUMNS.
     """
     client = YabbiClient()
     dict_rows = client.fetch_campaign_list(_to_ms(_global_start_date()), _end_of_day_ms(_yesterday()))
@@ -401,10 +484,17 @@ def get_banners_daily_stat(date_from: str, date_to: str) -> pd.DataFrame:
 
         for u, a in agg.items():
             all_rows.append({
-                "date": day, "campaign_id": url_to_camp.get(u), "URL": u,
-                "show": a["show"], "click": a["click"], "complete": a["complete"],
+                "date": day, "campaign_id": url_to_camp.get(u), "url": u,
+                "impressions": a["show"], "clicks": a["click"],
+                "video_views_100": a["complete"],
             })
     if not all_rows:
         return pd.DataFrame(columns=BANNERS_DAILY_COLUMNS)
     df = pd.DataFrame(all_rows)
+    df["account_id"] = ACCOUNT_ID
+    df["source_type_id"] = SOURCE_TYPE_ID
+    df["id_key_camp"] = df["campaign_id"].map(_id_key_camp)
+    df["id_key_ad"] = [
+        f"{k}_{u}" if k else None for k, u in zip(df["id_key_camp"], df["url"])
+    ]
     return df.reindex(columns=BANNERS_DAILY_COLUMNS).reset_index(drop=True)
