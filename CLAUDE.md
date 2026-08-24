@@ -93,4 +93,5 @@ print(y.get_campaigns_daily_stat("2026-07-01", "2026-07-01").head())
 - `info/00_yabbi_source.md` — сводка источника (SSOT): авторизация, endpoints, поля, решения.
 - `info/01_functions_implemented.md` — реестр реализованных функций.
 - `test/` — шаблонная система (перенесена из avito, адаптируется под no-API сценарий; см. `test/SCENARIO_no_api_cabinet.md`).
-- ТЗ для внешнего разработчика — `specs/TZ_yabbi_automate.md` (черновик).
+- ТЗ для внешнего разработчика — `specs/TZ_yabbi_automate.md` (**ФИНАЛ** с 2026-07-20,
+  подтверждён владельцем после двойного ревью; PDF-версия — `TZ_yabbi_automate.pdf` в корне).
